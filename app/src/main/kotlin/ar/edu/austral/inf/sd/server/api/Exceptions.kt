@@ -9,8 +9,15 @@ import jakarta.validation.ConstraintViolationException
 // TODO Extend ApiException for custom exception handling, e.g. the below NotFound exception
 sealed class ApiException(msg: String, val code: Int) : Exception(msg)
 
+class TimeOutException(msg: String) : ApiException(msg, HttpStatus.GATEWAY_TIMEOUT.value())
+class InternalErrorException(msg: String) : ApiException(msg, HttpStatus.INTERNAL_SERVER_ERROR.value())
+class NoServiceAvailableException(msg: String):ApiException(msg, HttpStatus.SERVICE_UNAVAILABLE.value())
 class NotFoundException(msg: String, code: Int = HttpStatus.NOT_FOUND.value()) : ApiException(msg, code)
 class BadRequestException(msg: String) : ApiException(msg, HttpStatus.BAD_REQUEST.value())
+class UnauthorizedException(msg: String) : ApiException(msg, HttpStatus.UNAUTHORIZED.value())
+
+
+
 
 
 @ControllerAdvice

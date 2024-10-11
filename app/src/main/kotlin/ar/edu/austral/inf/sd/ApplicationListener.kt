@@ -5,6 +5,7 @@ import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.context.event.ApplicationReadyEvent
 import org.springframework.context.event.EventListener
 import org.springframework.stereotype.Component
+import java.util.*
 
 @Component
 class ApplicationListener {
@@ -15,15 +16,17 @@ class ApplicationListener {
     var registerHost: String = ""
     @Value("\${register.port:-1}")
     var registerPort: Int = -1
+    @Value("\${register.uuid:}")
+    lateinit var uuid: String
+    @Value("\${register.salt:}")
+    lateinit var salt: String
 
     @EventListener(ApplicationReadyEvent::class)
     fun onApplicationReady(event: ApplicationReadyEvent) {
         //
         if (registerHost != "" && registerPort != -1) {
             println("me voy a registrar en el server $registerHost:$registerPort")
-            apiServices.registerToServer(registerHost, registerPort)
+            apiServices.registerToServer(registerHost, registerPort, UUID.fromString(uuid) , salt)
         }
     }
-
-
 }
