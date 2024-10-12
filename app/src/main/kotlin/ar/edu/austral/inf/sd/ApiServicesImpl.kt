@@ -21,6 +21,7 @@ import org.springframework.http.MediaType
 import org.springframework.http.ResponseEntity
 import org.springframework.util.LinkedMultiValueMap
 import org.springframework.web.client.*
+import java.util.concurrent.TimeUnit
 
 @Component
 class ApiServicesImpl @Autowired constructor(
@@ -35,6 +36,7 @@ class ApiServicesImpl @Autowired constructor(
 
     private var myRegisterHost = ""
     private var myRegisterPort = 0
+    private var serverTimeout: Int = 10
 
     private val nodes: MutableList<RegisterResponse> = mutableListOf()
     private var nextNode: RegisterResponse? = null
@@ -47,7 +49,7 @@ class ApiServicesImpl @Autowired constructor(
     private var currentMessageResponse = MutableStateFlow<PlayResponse?>(null)
     private var xGameTimestamp: Int = 0
     private var timeouts: Int = 0
-    private var ownSalt: String = newSalt()
+    private var ownSalt: String = Base64.getEncoder().encodeToString(Random.nextBytes(9))
     private var ownUuid = UUID.randomUUID()
     private val registeredPlayers: MutableList<Player> = mutableListOf()
 
@@ -63,9 +65,9 @@ class ApiServicesImpl @Autowired constructor(
                     }
                 }
             }
-            else if (player.uuid == uuid && player.salt != salt) {
-                throw UnauthorizedException("Salt does not match")
-            }
+//            else if (player.uuid == uuid && player.salt != salt) {
+//                throw UnauthorizedException("Salt does not match")
+//            }
         }
 
         val nextNode = if (nodes.isEmpty()) {
@@ -93,7 +95,7 @@ class ApiServicesImpl @Autowired constructor(
             sendRelayMessage(message, receivedContentType, nextNode!!, Signatures(updatedSignatures), xGameTimestamp)
         } else {
             // me llego algo, no lo tengo que pasar
-            if (currentMessageWaiting.value == null) throw BadRequestException("no waiting message")
+//            if (currentMessageWaiting.value == null) throw BadRequestException("no waiting message")
             val current = currentMessageWaiting.getAndUpdate { null }!!
             val response = current.copy(
                 contentResult = if (receivedHash == current.originalHash) "Success" else "Failure",
@@ -116,7 +118,7 @@ class ApiServicesImpl @Autowired constructor(
     override fun sendMessage(body: String): PlayResponse {
 
         //The coordinator does not accept more than 10 failures (cases 503 or 504)
-        if (timeouts >= 10) throw BadRequestException("Game is closed")
+//        if (timeouts >= 10) throw BadRequestException("We are not playing anymore")
 
         //TODO NO SE SI ES NECESARIO
 //        if (nodes.isEmpty()) {
@@ -128,11 +130,12 @@ class ApiServicesImpl @Autowired constructor(
         currentMessageWaiting.update { newResponse(body) }
         val contentType = currentRequest.contentType
 
-        val expectedSignatures = generateExpectedSignatures(body, registeredPlayers, contentType)
+        val expectedSignatures = expectedSignatures(body, registeredPlayers, contentType)
+        val lastNode = nodes.last()
 
-//        sendRelayMessage(body, contentType, toRegisterResponse(nodes.last(), -1), Signatures(listOf()), xGameTimestamp)
-//        resultReady.await(timeouts.toLong(), TimeUnit.SECONDS)
-//        resultReady = CountDownLatch(1)
+        sendRelayMessage(body, contentType, RegisterResponse(lastNode.nextHost, lastNode.nextPort, serverTimeout, -1 ), Signatures(listOf()), xGameTimestamp)
+        resultReady.await(timeouts.toLong(), TimeUnit.SECONDS)
+        resultReady = CountDownLatch(1)
 
         if (currentMessageResponse.value == null){
             timeouts += 1
@@ -144,21 +147,52 @@ class ApiServicesImpl @Autowired constructor(
             throw NoServiceAvailableException("Received different hash than original")
         }
 
-//        if (!compareSignatures(expectedSignatures, currentMessageResponse.value!!.signatures)){
-//            throw InternalErrorException("Missing signatures")
-//        }
+        if (!compareSignatures(expectedSignatures, currentMessageResponse.value!!.signatures)){
+            throw InternalErrorException("Missing signatures")
+        }
 
         return currentMessageResponse.value!!
     }
 
     override fun unregisterNode(uuid: UUID?, salt: String?): String {
-        registeredPlayers.forEach { player ->
-            if (player.uuid == uuid && player.salt == salt) {
-                registeredPlayers.remove(player)
-                return "Node unregistered"
+        val nodeToUnregister = registeredPlayers.find {
+            it.uuid == uuid!!
+        }
+
+        if (nodeToUnregister == null){
+            throw NotFoundException("Node with uuid: $uuid not found")
+        }
+
+        if (nodeToUnregister.salt != salt){
+            throw BadRequestException("Invalid data")
+        }
+
+        val nodeToUnregisterIndex = registeredPlayers.indexOf(nodeToUnregister)
+
+        if (nodeToUnregisterIndex < registeredPlayers.size - 1){
+            val previousNode = registeredPlayers[nodeToUnregisterIndex+1]
+            val nextNode = registeredPlayers[nodeToUnregisterIndex-1]
+
+            val reconfigureUrl = "http://${previousNode.host}:${previousNode.port}/reconfigure"
+            val reconfigureParams = "?uuid=${previousNode.uuid}&salt=${previousNode.salt}&nextHost=${nextNode.host}&nextPort=${nextNode.port}"
+
+            val url = reconfigureUrl + reconfigureParams
+
+            val requestHeaders = HttpHeaders().apply {
+                add("X-Game-Timestamp", xGameTimestamp.toString())
+            }
+            val request = HttpEntity(null, requestHeaders)
+
+            try {
+                restTemplate.postForEntity<String>(url, request)
+            } catch (e: RestClientException){
+                print("Could not reconfigure to: $url")
+                throw e
             }
         }
-        throw BadRequestException("The data provided does not match any registered node")
+
+        nodes.removeAt(nodeToUnregisterIndex)
+        return "Unregister Successful"
     }
 
     override fun reconfigure(
@@ -175,12 +209,10 @@ class ApiServicesImpl @Autowired constructor(
         return "Change accepted"
     }
 
-    internal fun registerToServer(registerHost: String, registerPort: Int, uuid: UUID, salt: String) {
-        val registerUrl = "http://$registerHost:$registerPort/register-node?host=localhost&port=$myServerPort&name=$myServerName&uuid=$uuid&salt=$salt"
+    internal fun registerToServer(registerHost: String, registerPort: Int) {
+        val registerUrl = "http://$registerHost:$registerPort/register-node?host=localhost&port=$myServerPort&name=$myServerName&uuid=$ownUuid&salt=$ownSalt"
         try {
             val response = restTemplate.postForEntity<RegisterResponse>(registerUrl)
-            ownSalt = salt
-            ownUuid = uuid
             myRegisterHost = registerHost
             myRegisterPort = registerPort
             val registerNodeResponse: RegisterResponse = response.body!!
@@ -200,10 +232,10 @@ class ApiServicesImpl @Autowired constructor(
         signatures: Signatures,
         xGameTimestamp: Int?
     ) {
-        if (xGameTimestamp!! <= lastTimestamp){
-            throw BadRequestException("The timestamp is not valid")
-        }
-        lastTimestamp = xGameTimestamp
+//        if (xGameTimestamp!! <= lastTimestamp){
+//            throw BadRequestException("The timestamp is not valid")
+//        }
+        lastTimestamp = xGameTimestamp!!
 
         val relayUrl = "http://${relayNode.nextHost}:${relayNode.nextPort}/relay"
 
@@ -250,18 +282,35 @@ class ApiServicesImpl @Autowired constructor(
     )
 
     private fun doHash(body: ByteArray, salt: String): String {
-        val saltBytes = Base64.getDecoder().decode(salt)
+        val cleanedSalt = cleanBase64(salt)
+        val saltBytes = Base64.getDecoder().decode(cleanedSalt)
         messageDigest.update(saltBytes)
         val digest = messageDigest.digest(body)
         return Base64.getEncoder().encodeToString(digest)
     }
 
-    private fun generateExpectedSignatures(body: String, nodes: MutableList<Player>, contentType: String): Signatures {
+    private fun cleanBase64(base64: String): String {
+        return base64.replace("\\s".toRegex(), "")
+    }
+    private fun expectedSignatures(body: String, nodes: MutableList<Player>, contentType: String): Signatures {
         val signatures = mutableListOf<Signature>()
         nodes.forEach { node ->
             signatures.add(Signature(node.name, doHash(body.encodeToByteArray(), node.salt), contentType, body.length))
         }
         return Signatures(signatures)
+    }
+
+    private fun compareSignatures(a: Signatures, b: Signatures): Boolean{
+        val aSignatureList = a.items
+        val bSignatureList = b.items.reversed()
+
+        if (aSignatureList.size != bSignatureList.size) return false
+
+        for (i in aSignatureList.indices) {
+            if (aSignatureList[i].hash != bSignatureList[i].hash) return false
+        }
+
+        return true
     }
 
     companion object {
